@@ -1,0 +1,50 @@
+{
+  "name": "@vraksha/esbuild-browser",
+  "version": "1.0.9",
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "src",
+    "dist",
+    "types",
+    "package.json"
+  ],
+  "main": "./dist/index.js",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "require": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./worker": {
+      "types": "./dist/worker.d.ts",
+      "require": "./dist/worker.js"
+    },
+    "./service-worker": {
+      "types": "./dist/service-worker.d.ts",
+      "require": "./dist/service-worker.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "scripts": {
+    "build": "rm -rf dist && mkdir dist && tsc && make",
+    "serve": "serve dist/ -c ../serve.json",
+    "prepublishOnly": "yarn build"
+  },
+  "dependencies": {
+    "buffer": "^6.0.3",
+    "comlink": "^4.4.2",
+    "esbuild-wasm": "^0.27.0",
+    "idb": "^8.0.3",
+    "mobx": "^6.15.0",
+    "node-path": "^0.0.3",
+    "notepack.io": "^3.0.1",
+    "p-queue": "^8.1.0"
+  },
+  "devDependencies": {
+    "esbuild": "^0.27.0",
+    "typescript": "^5.5.4"
+  }
+}
