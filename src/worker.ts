@@ -14,7 +14,7 @@
 import type {IPCRequest, IPCResponse, IPCStatus} from './ipc';
 import {NPMInstaller} from './dependencies-installer';
 import {FileSystemManager} from './file-system-manager';
-import {setFilesBulk, resetFileSystem} from './helpers/fs';
+import {setFilesBulk} from './helpers/fs';
 
 declare const esbuild: any;
 
@@ -233,8 +233,7 @@ const handler = function <R extends IPCRequest>(
     // Transform API
     if (request.command_ === 'transform') {
       if (request.options_.color === false) color = false;
-      // Ensure a clean FS for each transform
-      resetFileSystem({});
+      setFilesBulk({});
       start = perf.now();
       this.transform(request.input_, request.options_).then(
         ({code, map, js, jsSourceMap, warnings, mangleCache, legalComments}) =>
@@ -256,8 +255,7 @@ const handler = function <R extends IPCRequest>(
     // Build API
     else if (request.command_ === 'build') {
       if (request.options_.color === false) color = false;
-      // Reset FS with the provided input to avoid cross-build state
-      resetFileSystem(request.input_);
+      setFilesBulk(request.input_);
       const outdir = '/dist/';
 
       start = perf.now();

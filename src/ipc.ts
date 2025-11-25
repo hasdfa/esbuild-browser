@@ -1,6 +1,5 @@
 // Credits: https://github.com/esbuild/esbuild.github.io/blob/main/src/try/ipc.ts
 import type {FormatMessagesOptions} from 'esbuild-wasm';
-import PQueue from 'p-queue';
 import {emitter} from './global';
 
 export type IPCStatus = 'resolve' | 'reject' | 'progress';
@@ -8,9 +7,6 @@ export type IPCStatus = 'resolve' | 'reject' | 'progress';
 export interface IPCInitOptions {
   esbuildVersion: string;
   workerUrl: string;
-  // Dynamic pool size bounds. If omitted, defaults are min=2, max=5.
-  minConcurrency?: number;
-  maxConcurrency?: number;
 }
 
 export interface OutputFile {
@@ -76,6 +72,8 @@ interface Task {
 }
 
 let workerText: Promise<string> | null = null;
+let activeTask: Task | null = null;
+let pendingTask: Task | null = null;
 
 // Waiting to a resolved function
 let waitingPromise: Record<
@@ -87,26 +85,22 @@ let waitingPromise: Record<
   }
 > = {};
 
-let on_reload: (options: IPCInitOptions) => Promise<Worker[]> = async () =>
+let on_reload: (options: IPCInitOptions) => Promise<Worker> = async () =>
   null as any;
 emitter.on('reload', options => on_reload(options));
 
-let workerPoolPromise = new Promise<Worker[]>((resolve, reject) => {
+let workerPromise = new Promise<Worker>((resolve, reject) => {
   on_reload = options => {
-    const reloadPromise = reloadWorkerPool(options);
+    const reloadPromise = reloadWorker(options);
     reloadPromise.then(resolve, reject);
     on_reload = options => {
-      workerPoolPromise.then(workers => workers.forEach(w => w.terminate()));
-      workerPoolPromise = reloadWorkerPool(options);
-      return workerPoolPromise;
+      workerPromise.then(worker => worker.terminate());
+      workerPromise = reloadWorker(options);
+      return workerPromise;
     };
     return reloadPromise;
   };
 });
-
-// Pool state for scheduling
-let availableWorkers: Worker[] = [];
-let poolQueue: PQueue | null = null;
 
 const do_fetch: typeof fetch = (url, options) => {
   emitter.status = `Fetching ${url}`;
@@ -130,31 +124,17 @@ async function packageFetch(subpath: string): Promise<Response> {
   return do_fetch(`https://unpkg.com/${subpath}`);
 }
 
-function clamp(n: number, min: number, max: number) {
-  return Math.max(min, Math.min(max, n));
-}
-
-function decidePoolSize(options: IPCInitOptions): number {
-  const min = options.minConcurrency ?? 2;
-  const max = options.maxConcurrency ?? 5;
-  const hw = (typeof navigator !== 'undefined' && navigator && navigator.hardwareConcurrency) || 2;
-  return clamp(hw, min, max);
-}
-
-async function reloadWorkerPool(options: IPCInitOptions): Promise<Worker[]> {
+async function reloadWorker(options: IPCInitOptions): Promise<Worker> {
   const {esbuildVersion: version, workerUrl} = options;
 
   let loadingFailure: string | undefined;
   emitter.status = `Loading esbuild ${version}…`;
 
   try {
-    // Abort all pending promises
-    for (const [id, entry] of Object.entries(waitingPromise)) {
-      try {
-        entry?.reject?.(new Error('Task aborted due to reload'));
-      } catch {}
-      delete waitingPromise[id];
-    }
+    if (activeTask) activeTask.abort_();
+    if (pendingTask) pendingTask.abort_();
+    activeTask = null;
+    pendingTask = null;
 
     // "browser.min.js" was added in version 0.8.33
     const [major, minor, patch] = version.split('.').map(x => +x);
@@ -175,55 +155,51 @@ async function reloadWorkerPool(options: IPCInitOptions): Promise<Worker[]> {
     const i = workerJS.lastIndexOf('//# sourceMappingURL=');
     const workerJSWithoutSourceMap = i >= 0 ? workerJS.slice(0, i) : workerJS;
     const parts = [esbuildJS, `\nvar polywasm=1;`, workerJSWithoutSourceMap];
+    const url = URL.createObjectURL(
+      new Blob(parts, {type: 'application/javascript'}),
+    );
 
-    const createWorkerInstance = (): Promise<Worker> => {
-      const url = URL.createObjectURL(
-        new Blob(parts, {type: 'application/javascript'}),
-      );
-      return new Promise<Worker>((resolve, reject) => {
-        const worker = new Worker(url, {type: 'module'});
-        worker.onmessage = e => {
-          worker.onmessage = null;
+    return await new Promise<Worker>((resolve, reject) => {
+      const worker = new Worker(url, {type: 'module'});
+      worker.onmessage = e => {
+        worker.onmessage = null;
 
-          if (e.data[0] === 'success') {
-            // After init, route all messages via the waitingPromise map
-            worker.onmessage = e => {
-              if (
-                e.data &&
-                Array.isArray(e.data) &&
-                e.data.length === 3 &&
-                waitingPromise[e.data[0]]
-              ) {
-                const [id, status, data] = e.data;
-                waitingPromise[id]?.[status]?.(data);
+        if (e.data[0] === 'success') {
+          resolve(worker);
+          worker.onmessage = e => {
+            if (
+              e.data &&
+              Array.isArray(e.data) &&
+              e.data.length === 3 &&
+              waitingPromise[e.data[0]]
+            ) {
+              const [id, status, data] = e.data;
+              waitingPromise[id]?.[status]?.(data);
 
-                // If the promise is resolved or rejected, remove it from the waiting list
-                if (['resolve', 'reject'].includes(status)) {
-                  delete waitingPromise[id];
-                }
+              // If the promise is resolved or rejected, remove it from the waiting list
+              if (['resolve', 'reject'].includes(status)) {
+                delete waitingPromise[id];
               }
-            };
-            resolve(worker);
-          } else {
-            reject(new Error('Failed to create worker'));
-            loadingFailure = e.data[1];
-          }
-          URL.revokeObjectURL(url);
-        };
-        worker.postMessage(['setup', version, esbuildWASM], [esbuildWASM]);
-      });
-    };
+            }
+          };
 
-    const poolSize = decidePoolSize(options);
-    const workers = await Promise.all(Array.from({length: poolSize}, () => createWorkerInstance()));
-
-    // Initialize pool scheduling
-    availableWorkers = [...workers];
-    poolQueue = new PQueue({concurrency: workers.length});
-
-    emitter.status = `Loaded esbuild ${version} (x${workers.length})`;
-    emitter.ready = true;
-    return workers;
+          console.debug('resolve', worker);
+          emitter.status = 'Loaded esbuild ' + version;
+          emitter.ready = true;
+        } else {
+          console.debug('reject', e.data);
+          reject(new Error('Failed to create worker'));
+          loadingFailure = e.data[1];
+        }
+        URL.revokeObjectURL(url);
+      };
+      console.debug(
+        'worker.postMessage',
+        ['setup', version, esbuildWASM],
+        [esbuildWASM],
+      );
+      worker.postMessage(['setup', version, esbuildWASM], [esbuildWASM]);
+    });
   } catch (err) {
     emitter.status = loadingFailure || err + '';
     console.error('reloadWorker', err);
@@ -296,42 +272,23 @@ export function sendIPC<Request extends IPCRequest>(
   //   )
   // })
 
-  return workerPoolPromise.then(() => {
-    if (!poolQueue) throw new Error('Worker pool not initialized');
+  return workerPromise.then(worker => {
+    const id = Math.random().toString(36).substring(2, 15);
+    const promise = new Promise<IPCResponse<Request>>(
+      (promiseResolve, promiseReject) => {
+        waitingPromise[id] = {
+          progress,
+          resolve: (data: any) => {
+            promiseResolve(data);
+          },
+          reject: (error: any) => {
+            promiseReject(error);
+          },
+        };
+      },
+    );
 
-    return poolQueue.add(async () => {
-      // Acquire a worker
-      const worker = availableWorkers.pop();
-      if (!worker) {
-        // Should not happen due to poolQueue concurrency == pool size
-        throw new Error('No available worker');
-      }
-
-      const id = (typeof crypto !== 'undefined' && 'randomUUID' in crypto)
-        ? (crypto as any).randomUUID()
-        : Math.random().toString(36).substring(2, 15);
-
-      const promise = new Promise<IPCResponse<Request>>(
-        (promiseResolve, promiseReject) => {
-          waitingPromise[id] = {
-            progress,
-            resolve: (data: any) => {
-              // Release worker on completion
-              availableWorkers.push(worker);
-              promiseResolve(data);
-            },
-            reject: (error: any) => {
-              availableWorkers.push(worker);
-              promiseReject(error);
-            },
-          };
-        },
-      );
-
-      worker.postMessage([id, message]);
-      return promise;
-    }, {
-      throwOnTimeout: true,
-    });
+    worker.postMessage([id, message]);
+    return promise;
   });
 }
